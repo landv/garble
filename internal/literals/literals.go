@@ -33,8 +33,8 @@ func randObfuscator() obfuscator {
 	return obfuscators[randPos]
 }
 
-// Obfuscate replace literals with obfuscated lambda functions
-func Obfuscate(files []*ast.File, info *types.Info, fset *token.FileSet, ignoreObj map[types.Object]bool) []*ast.File {
+// Obfuscate replaces literals with obfuscated anonymous functions.
+func Obfuscate(file *ast.File, info *types.Info, fset *token.FileSet, ignoreObj map[types.Object]bool) *ast.File {
 	pre := func(cursor *astutil.Cursor) bool {
 		switch x := cursor.Node().(type) {
 		case *ast.GenDecl:
@@ -42,8 +42,9 @@ func Obfuscate(files []*ast.File, info *types.Info, fset *token.FileSet, ignoreO
 				return true
 			}
 			for _, spec := range x.Specs {
-				spec, ok := spec.(*ast.ValueSpec)
-				if !ok {
+				spec := spec.(*ast.ValueSpec) // guaranteed for Tok==CONST
+				if len(spec.Values) == 0 {
+					// skip constants with inferred values
 					return false
 				}
 
@@ -108,7 +109,7 @@ func Obfuscate(files []*ast.File, info *types.Info, fset *token.FileSet, ignoreO
 
 					data[i] = byte(value)
 				}
-				cursor.Replace(obfuscateByteArray(data, y.Len()))
+				cursor.Replace(withPos(obfuscateByteArray(data, y.Len()), x.Pos()))
 
 			case *types.Slice:
 				if y.Elem() != byteType {
@@ -133,7 +134,7 @@ func Obfuscate(files []*ast.File, info *types.Info, fset *token.FileSet, ignoreO
 
 					data = append(data, byte(value))
 				}
-				cursor.Replace(obfuscateByteSlice(data))
+				cursor.Replace(withPos(obfuscateByteSlice(data), x.Pos()))
 
 			}
 
@@ -163,16 +164,58 @@ func Obfuscate(files []*ast.File, info *types.Info, fset *token.FileSet, ignoreO
 				return true
 			}
 
-			cursor.Replace(obfuscateString(value))
+			cursor.Replace(withPos(obfuscateString(value), x.Pos()))
 		}
 
 		return true
 	}
 
-	for i := range files {
-		files[i] = astutil.Apply(files[i], pre, post).(*ast.File)
-	}
-	return files
+	return astutil.Apply(file, pre, post).(*ast.File)
+}
+
+// withPos sets any token.Pos fields under node which affect printing to pos.
+// Note that we can't set all token.Pos fields, since some affect the semantics.
+//
+// This function is useful so that go/printer doesn't try to estimate position
+// offsets, which can end up in printing comment directives too early.
+//
+// We don't set any "end" or middle positions, because they seem irrelevant.
+func withPos(node ast.Node, pos token.Pos) ast.Node {
+	ast.Inspect(node, func(node ast.Node) bool {
+		switch node := node.(type) {
+		case *ast.BasicLit:
+			node.ValuePos = pos
+		case *ast.Ident:
+			node.NamePos = pos
+		case *ast.CompositeLit:
+			node.Lbrace = pos
+			node.Rbrace = pos
+		case *ast.ArrayType:
+			node.Lbrack = pos
+		case *ast.FuncType:
+			node.Func = pos
+		case *ast.BinaryExpr:
+			node.OpPos = pos
+		case *ast.StarExpr:
+			node.Star = pos
+		case *ast.CallExpr:
+			node.Lparen = pos
+			node.Rparen = pos
+
+		case *ast.GenDecl:
+			node.TokPos = pos
+		case *ast.ReturnStmt:
+			node.Return = pos
+		case *ast.ForStmt:
+			node.For = pos
+		case *ast.RangeStmt:
+			node.For = pos
+		case *ast.BranchStmt:
+			node.TokPos = pos
+		}
+		return true
+	})
+	return node
 }
 
 func obfuscateString(data string) *ast.CallExpr {
@@ -238,8 +281,13 @@ func RecordUsedAsConstants(node ast.Node, info *types.Info, ignoreObj map[types.
 			return true
 		}
 
+		// Only record *types.Const objects.
+		// Other objects, such as builtins or type names,
+		// must not be recorded as they would be false positives.
 		obj := info.ObjectOf(ident)
-		ignoreObj[obj] = true
+		if _, ok := obj.(*types.Const); ok {
+			ignoreObj[obj] = true
+		}
 
 		return true
 	}

@@ -1,11 +1,10 @@
 module mvdan.cc/garble
 
-go 1.15
+go 1.16
 
 require (
-	github.com/Binject/debug v0.0.0-20210101210738-1b03ff50b8a5
-	github.com/google/go-cmp v0.5.4
-	github.com/rogpeppe/go-internal v1.7.1-0.20210131190821-dc4b49510d96
-	golang.org/x/mod v0.4.1
-	golang.org/x/tools v0.0.0-20210115202250-e0d201561e39
+	github.com/google/go-cmp v0.5.5
+	github.com/rogpeppe/go-internal v1.8.0
+	golang.org/x/mod v0.4.2
+	golang.org/x/tools v0.1.1-0.20210430200834-7a6108e9b210
 )

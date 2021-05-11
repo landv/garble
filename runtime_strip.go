@@ -89,8 +89,8 @@ func stripRuntime(filename string, file *ast.File) {
 			case "traceback.go":
 				// only used for printing tracebacks
 				switch x.Name.Name {
-				case "tracebackdefers", "traceback", "tracebacktrap", "traceback1",
-					"goroutineheader", "tracebackothers", "tracebackHexdump":
+				case "tracebackdefers", "printcreatedby", "printcreatedby1", "traceback", "tracebacktrap", "traceback1", "printAncestorTraceback",
+					"printAncestorTracebackFuncInfo", "goroutineheader", "tracebackothers", "tracebackHexdump", "printCgoTraceback":
 					x.Body.List = nil
 				case "printOneCgoTraceback":
 					x.Body = ah.BlockStmt(ah.ReturnStmt(ah.IntLit(0)))
@@ -119,7 +119,19 @@ func stripRuntime(filename string, file *ast.File) {
 		}
 	}
 
-	if filename == "print.go" {
+	switch filename {
+	case "runtime1.go":
+		// On Go 1.16.x, the code above results in runtime1.go having an
+		// unused import. Mark it as used via "var _ = pkg.Func".
+		// If this is a recurring problem, we could go for a more
+		// generic solution like x/tools/imports.
+		for _, imp := range file.Imports {
+			if imp.Path.Value == `"internal/bytealg"` {
+				file.Decls = append(file.Decls, markUsedBytealg)
+				break
+			}
+		}
+	case "print.go":
 		file.Decls = append(file.Decls, hidePrintDecl)
 		return
 	}
@@ -140,6 +152,17 @@ func removeImport(importPath string, specs []ast.Spec) []ast.Spec {
 	}
 
 	return specs
+}
+
+var markUsedBytealg = &ast.GenDecl{
+	Tok: token.VAR,
+	Specs: []ast.Spec{&ast.ValueSpec{
+		Names: []*ast.Ident{{Name: "_"}},
+		Values: []ast.Expr{&ast.SelectorExpr{
+			X:   &ast.Ident{Name: "bytealg"},
+			Sel: &ast.Ident{Name: "IndexByteString"},
+		}},
+	}},
 }
 
 var hidePrintDecl = &ast.FuncDecl{

@@ -20,8 +20,7 @@ garble build -tags buildtag
 exec ./main
 cmp stdout main.stdout
 
-! binsubstr main$exe 'ImportedVar' 'ImportedConst' 'ImportedFunc' 'ImportedType' 'main.go' 'test/main' 'imported.' 'NormalStruct' 'NormalExportedField' 'normalUnexportedField'
-binsubstr main$exe 'ReflectInDefined' 'ExportedField2' 'unexportedField2'
+! binsubstr main$exe 'ImportedVar' 'ImportedConst' 'ImportedFunc' 'main.go' 'test/main' 'importedpkg.' 'NormalStruct' 'normalUnexportedField'
 
 [short] stop # checking that the build is reproducible is slow
 
@@ -45,12 +44,17 @@ cmp stdout main.stdout
 -- go.mod --
 module test/main
 
-go 1.15
+go 1.16
 
-require rsc.io/quote v1.5.2
+require (
+	rsc.io/quote v1.5.2
+	gopkg.in/garbletest.v2 v2.999.0
+)
 -- go.sum --
 golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c h1:pvCbr/wm8HzDD3fVywevekufpn6tCGPY3spdHeZJEsw=
 golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+gopkg.in/garbletest.v2 v2.999.0 h1:wiZfOKGiXX7DoYVgbNvnTaCjqElrpZQSvKg0HYouw/o=
+gopkg.in/garbletest.v2 v2.999.0/go.mod h1:MF1BPTBjmDdc9x86+9UMLL9pAH2eMFPHvltohOvlGEw=
 rsc.io/quote v1.5.2 h1:3fEykkD9k7lYzXqCYrwGAf7iNhbk4yCjHmKBN9td4L0=
 rsc.io/quote v1.5.2/go.mod h1:LzX7hefJvL54yjefDEDHNONDjII0t9xZLPXsUe+TKr0=
 rsc.io/sampler v1.3.0 h1:HLGR/BgEtI3r0uymSP/nl2uPLsUnNJX8toRyhfpBTII=
@@ -60,37 +64,24 @@ package main
 
 import (
 	"fmt"
-	"reflect"
 	"strings"
 
-	"test/main/imported"
+	"test/main/importedpkg"
 
 	"rsc.io/quote"
+	garbletest "gopkg.in/garbletest.v2"
 )
 
 func main() {
-	fmt.Println(imported.ImportedVar)
-	fmt.Println(imported.ImportedConst)
-	fmt.Println(imported.ImportedFunc('x'))
-	fmt.Println(imported.ImportedType(3))
-	fmt.Println(imported.ReflectInDefinedVar.ExportedField2)
-	fmt.Println(imported.ReflectInDefined{ExportedField2: 5})
-	normal := imported.NormalStruct{SharedName: 3}
+	fmt.Println(importedpkg.ImportedVar)
+	fmt.Println(importedpkg.ImportedConst)
+	fmt.Println(importedpkg.ImportedFunc('x'))
+	normal := importedpkg.NormalStruct{SharedName: 3}
 	normal.IndirectStruct.Field = 23
 	fmt.Println(normal)
-	printfWithoutPackage("%T\n", imported.ReflectTypeOf(2))
-	printfWithoutPackage("%T\n", imported.ReflectTypeOfIndirect(4))
-
-	v := imported.ReflectValueOfVar
-	printfWithoutPackage("%#v\n", v)
-	method := reflect.ValueOf(&v).MethodByName("ExportedMethodName")
-	if method.IsValid() {
-		fmt.Println(method.Call(nil))
-	} else {
-		fmt.Println("method not found")
-	}
 
 	fmt.Println(quote.Go())
+	garbletest.Test()
 }
 
 func printfWithoutPackage(format string, v interface{}) {
@@ -110,12 +101,23 @@ package main
 import "fmt"
 
 func init() { fmt.Println("buildtag init func") }
--- imported/imported.go --
-package imported
+-- differentpkg_unnamed.go --
+package main
+
+import "test/main/different-pkg-name"
+
+var _ = actualpkgname.Noop
+-- differentpkg_named.go --
+package main
+
+import named "test/main/different-pkg-name"
+
+var _ = named.Noop
+-- importedpkg/imported.go --
+package importedpkg
 
 import (
-	"reflect"
-	"test/main/imported/indirect"
+	"test/main/importedpkg/indirect"
 )
 
 var ImportedVar = "imported var value"
@@ -126,36 +128,6 @@ func ImportedFunc(param rune) string {
 	return string(param)
 }
 
-type ReflectTypeOf int
-
-var _ = reflect.TypeOf(ReflectTypeOf(0))
-
-type ReflectTypeOfIndirect int
-
-var _ = reflect.TypeOf(new([]*ReflectTypeOfIndirect))
-
-type ReflectValueOf struct {
-	ExportedField string
-
-	unexportedField string
-}
-
-func (r *ReflectValueOf) ExportedMethodName() string { return "method: " + r.ExportedField }
-
-var ReflectValueOfVar = ReflectValueOf{ExportedField: "abc"}
-
-var _ = reflect.TypeOf(ReflectValueOfVar)
-
-type ReflectInDefined struct {
-	ExportedField2 int
-
-	unexportedField2 int
-}
-
-var ReflectInDefinedVar = ReflectInDefined{ExportedField2: 9000}
-
-var _ = reflect.TypeOf(ReflectInDefinedVar)
-
 const SharedName = 2
 
 type NormalStruct struct {
@@ -164,27 +136,22 @@ type NormalStruct struct {
 	normalUnexportedField int
 }
 
-// ImportedType comes after the calls to reflect, to ensure no false positives.
-type ImportedType int
-
--- imported/indirect/indirect.go --
+-- importedpkg/indirect/indirect.go --
 package indirect
 
 type Indirect struct {
 	Field int
 }
 
+-- different-pkg-name/pkg.go --
+package actualpkgname
+
+var Noop int
+
 -- main.stdout --
 buildtag init func
 imported var value
 imported const value
 x
-3
-9000
-{5 0}
 {3 {23} 0}
-ReflectTypeOf
-ReflectTypeOfIndirect
-ReflectValueOf{ExportedField:"abc", unexportedField:""}
-[method: abc]
 Don't communicate by sharing memory, share memory by communicating.
