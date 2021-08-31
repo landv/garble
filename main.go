@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -55,7 +54,7 @@ var (
 func init() {
 	flagSet.Usage = usage
 	flagSet.BoolVar(&flagGarbleLiterals, "literals", false, "Obfuscate literals such as strings")
-	flagSet.BoolVar(&flagGarbleTiny, "tiny", false, "Optimize for binary size, losing the ability to reverse the process")
+	flagSet.BoolVar(&flagGarbleTiny, "tiny", false, "Optimize for binary size, losing some ability to reverse the process")
 	flagSet.StringVar(&flagDebugDir, "debugdir", "", "Write the obfuscated source to a directory, e.g. -debugdir=out")
 	flagSet.StringVar(&flagSeed, "seed", "", "Provide a base64-encoded seed, e.g. -seed=o9WDTZ4CN4w\nFor a random seed, provide -seed=random")
 }
@@ -64,21 +63,24 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `
 Garble obfuscates Go code by wrapping the Go toolchain.
 
-Usage:
-
-	garble [garble flags] command [arguments]
+	garble [garble flags] command [go flags] [go arguments]
 
 For example, to build an obfuscated program:
 
 	garble build ./cmd/foo
 
+Similarly, to combine garble flags and Go build flags:
+
+	garble -literals build -tags=purego ./cmd/foo
+
 The following commands are supported:
 
-	build [packages]   wraps "go build"
-	test [packages]    wraps "go test"
-	reverse [files]    de-obfuscates output such as stack traces
+	build [packages]   replace "go build"
+	test [packages]    replace "go test"
+	version            print Garble version
+	reverse [files]    de-obfuscate output such as stack traces
 
-garble accepts the following flags:
+garble accepts the following flags before a command:
 
 `[1:])
 	flagSet.PrintDefaults()
@@ -221,27 +223,25 @@ func main1() int {
 		return 2
 	}
 	if err := mainErr(args); err != nil {
-		switch err {
-		case flag.ErrHelp:
-			usage()
-			return 2
-		case errJustExit:
-		default:
-			fmt.Fprintln(os.Stderr, err)
+		if code, ok := err.(errJustExit); ok {
+			os.Exit(int(code))
+		}
+		fmt.Fprintln(os.Stderr, err)
 
-			// If the build failed and a random seed was used,
-			// the failure might not reproduce with a different seed.
-			// Print it before we exit.
-			if flagSeed == "random" {
-				fmt.Fprintf(os.Stderr, "random seed: %s\n", base64.RawStdEncoding.EncodeToString(opts.Seed))
-			}
+		// If the build failed and a random seed was used,
+		// the failure might not reproduce with a different seed.
+		// Print it before we exit.
+		if flagSeed == "random" {
+			fmt.Fprintf(os.Stderr, "random seed: %s\n", base64.RawStdEncoding.EncodeToString(opts.Seed))
 		}
 		return 1
 	}
 	return 0
 }
 
-var errJustExit = errors.New("")
+type errJustExit int
+
+func (e errJustExit) Error() string { return fmt.Sprintf("exit: %d", e) }
 
 func goVersionOK() bool {
 	const (
@@ -309,7 +309,8 @@ func mainErr(args []string) error {
 		if len(args) > 0 {
 			return fmt.Errorf("the help command does not take arguments")
 		}
-		return flag.ErrHelp
+		usage()
+		return errJustExit(2)
 	case "version":
 		if len(args) > 0 {
 			return fmt.Errorf("the version command does not take arguments")
@@ -362,7 +363,7 @@ func mainErr(args []string) error {
 
 	// Workaround for https://github.com/golang/go/issues/44963.
 	// TODO(mvdan): remove once we only support Go 1.17 and later.
-	if tool == "compile" {
+	if tool == "compile" && !strings.Contains(toolexecImportPath, ".test]") {
 		isTestPkg := false
 		_, paths := splitFlagsFromFiles(args, ".go")
 		for _, path := range paths {
@@ -400,6 +401,16 @@ func mainErr(args []string) error {
 	return nil
 }
 
+func hasHelpFlag(flags []string) bool {
+	for _, f := range flags {
+		switch f {
+		case "-h", "-help", "--help":
+			return true
+		}
+	}
+	return false
+}
+
 // toolexecCmd builds an *exec.Cmd which is set up for running "go <command>"
 // with -toolexec=garble and the supplied arguments.
 //
@@ -409,11 +420,15 @@ func toolexecCmd(command string, args []string) (*exec.Cmd, error) {
 	// Split the flags from the package arguments, since we'll need
 	// to run 'go list' on the same set of packages.
 	flags, args := splitFlagsFromArgs(args)
-	for _, f := range flags {
-		switch f {
-		case "-h", "-help", "--help":
-			return nil, flag.ErrHelp
-		}
+	if hasHelpFlag(flags) {
+		out, _ := exec.Command("go", command, "-h").CombinedOutput()
+		fmt.Fprintf(os.Stderr, `
+usage: garble [garble flags] %s [arguments]
+
+This command wraps "go %s". Below is its help:
+
+%s`[1:], command, command, out)
+		return nil, errJustExit(2)
 	}
 
 	if err := setFlagOptions(); err != nil {
@@ -436,7 +451,7 @@ func toolexecCmd(command string, args []string) (*exec.Cmd, error) {
 	}
 
 	if !goVersionOK() {
-		return nil, errJustExit
+		return nil, errJustExit(1)
 	}
 
 	var err error
@@ -573,6 +588,11 @@ func transformAsm(args []string) ([]string, error) {
 			buf.WriteString(newName)
 		}
 
+		// Uncomment for some quick debugging. Do not delete.
+		// if curPkg.Private {
+		// 	fmt.Fprintf(os.Stderr, "\n-- %s --\n%s", path, buf.Bytes())
+		// }
+
 		name := filepath.Base(path)
 		if path, err := writeTemp(name, buf.Bytes()); err != nil {
 			return nil, err
@@ -656,7 +676,7 @@ func transformCompile(args []string) ([]string, error) {
 		return nil, err
 	}
 
-	tf.recordReflectArgs(files)
+	tf.prefillIgnoreObjects(files)
 	// log.Println(flags)
 
 	// If this is a package to obfuscate, swap the -p flag with the new
@@ -670,14 +690,12 @@ func transformCompile(args []string) ([]string, error) {
 	newPaths := make([]string, 0, len(files))
 
 	for i, file := range files {
-		tf.handleDirectives(file.Comments)
-
 		name := filepath.Base(paths[i])
-		switch {
-		case curPkg.ImportPath == "runtime":
+		switch curPkg.ImportPath {
+		case "runtime":
 			// strip unneeded runtime code
 			stripRuntime(name, file)
-		case curPkg.ImportPath == "runtime/internal/sys":
+		case "runtime/internal/sys":
 			// The first declaration in zversion.go contains the Go
 			// version as follows. Replace it here, since the
 			// linker's -X does not work with constants.
@@ -685,15 +703,22 @@ func transformCompile(args []string) ([]string, error) {
 			//     const TheVersion = `devel ...`
 			//
 			// Don't touch the source in any other way.
+			// TODO: remove once we only support Go 1.17 and later,
+			// as from that point we can just rely on linking -X flags.
 			if name != "zversion.go" {
 				break
 			}
 			spec := file.Decls[0].(*ast.GenDecl).Specs[0].(*ast.ValueSpec)
+			if len(spec.Names) != 1 || spec.Names[0].Name != "TheVersion" {
+				break
+			}
 			lit := spec.Values[0].(*ast.BasicLit)
 			lit.Value = "`unknown`"
-		case strings.HasPrefix(name, "_cgo_"):
+		}
+		if strings.HasPrefix(name, "_cgo_") {
 			// Don't obfuscate cgo code, since it's generated and it gets messy.
-		default:
+		} else {
+			tf.handleDirectives(file.Comments)
 			file = tf.transformGo(file)
 		}
 		if newPkgPath != "" {
@@ -779,9 +804,6 @@ func (tf *transformer) handleDirectives(comments []*ast.CommentGroup) {
 				pkgPath, name = target[0], target[1]
 			}
 
-			if pkgPath == "runtime" && strings.HasPrefix(name, "cgo") {
-				continue // ignore cgo-generated linknames
-			}
 			lpkg, err := listPackage(pkgPath)
 			if err != nil {
 				// probably a made up symbol name, replace the comment
@@ -874,9 +896,10 @@ var runtimeRelated = map[string]bool{
 	"vendor/golang.org/x/net/dns/dnsmessage": true,
 	"vendor/golang.org/x/net/route":          true,
 
-	// Manual additions for Go 1.17 as of April 2021.
-	"internal/abi":  true,
-	"internal/itoa": true,
+	// Manual additions for Go 1.17 as of June 2021.
+	"internal/abi":          true,
+	"internal/itoa":         true,
+	"internal/goexperiment": true,
 }
 
 // isPrivate checks if a package import path should be considered private,
@@ -992,13 +1015,65 @@ func processImportCfg(flags []string) (newImportCfg string, _ error) {
 	return newCfg.Name(), nil
 }
 
-// recordReflectArgs collects all the objects in a package which are known to be
-// used as arguments to reflect.TypeOf or reflect.ValueOf. Since we obfuscate
-// one package at a time, we only detect those if the type definition and the
-// reflect usage are both in the same package.
+type knownReflect struct {
+	pkgPath string
+	name    string
+}
+
+type funcFullName = string
+
+// knownReflectAPIs is a static record of what std APIs use reflection on their
+// parameters, so we can avoid obfuscating types used with them.
 //
-// The resulting map mainly contains named types and their field declarations.
-func (tf *transformer) recordReflectArgs(files []*ast.File) {
+// For now, this table is manually maintained, until we automatically detect and
+// propagate the uses of reflect in std and third party APIs.
+// If we end up maintaining this table for a long time, we should probably
+// improve the process via either code generation or sanity checks.
+//
+// TODO: record which parameters get used with reflection, as it's often not all
+// of them.
+//
+// TODO: we're not including fmt.Printf, as it would have many false positives,
+// unless we were smart enough to detect which arguments get used as %#v or %T.
+//
+// TODO: this should also support third party APIs; see
+// https://github.com/burrowers/garble/issues/162
+var knownReflectAPIs = map[funcFullName]bool{
+	"reflect.TypeOf":  true,
+	"reflect.ValueOf": true,
+
+	"encoding/json.Marshal":           true,
+	"encoding/json.MarshalIndent":     true,
+	"encoding/json.Unmarshal":         true,
+	"(*encoding/json.Decoder).Decode": true,
+	"(*encoding/json.Encoder).Encode": true,
+
+	"encoding/gob.Register":          true,
+	"encoding/gob.RegisterName":      true,
+	"(*encoding/gob.Decoder).Decode": true,
+	"(*encoding/gob.Encoder).Encode": true,
+
+	"encoding/xml.Marshal":                  true,
+	"encoding/xml.MarshalIndent":            true,
+	"encoding/xml.Unmarshal":                true,
+	"(*encoding/xml.Decoder).Decode":        true,
+	"(*encoding/xml.Encoder).Encode":        true,
+	"(*encoding/xml.Decoder).DecodeElement": true,
+	"(*encoding/xml.Encoder).EncodeElement": true,
+
+	"(*text/template.Template).Execute": true,
+
+	"(*html/template.Template).Execute": true,
+
+	"net/rpc.Register":     true,
+	"net/rpc.RegisterName": true,
+}
+
+// prefillIgnoreObjects collects objects which should not be obfuscated,
+// such as those used as arguments to reflect.TypeOf or reflect.ValueOf.
+// Since we obfuscate one package at a time, we only detect those if the type
+// definition and the reflect usage are both in the same package.
+func (tf *transformer) prefillIgnoreObjects(files []*ast.File) {
 	tf.ignoreObjects = make(map[types.Object]bool)
 
 	visit := func(node ast.Node) bool {
@@ -1014,13 +1089,14 @@ func (tf *transformer) recordReflectArgs(files []*ast.File) {
 		if !ok {
 			return true
 		}
-		fnType := tf.info.ObjectOf(sel.Sel)
-
-		if fnType.Pkg() == nil {
+		fnType, _ := tf.info.ObjectOf(sel.Sel).(*types.Func)
+		if fnType == nil || fnType.Pkg() == nil {
 			return true
 		}
 
-		if fnType.Pkg().Path() == "reflect" && (fnType.Name() == "TypeOf" || fnType.Name() == "ValueOf") {
+		fullName := fnType.FullName()
+		// log.Printf("%s: %s", fset.Position(node.Pos()), fullName)
+		if knownReflectAPIs[fullName] {
 			for _, arg := range call.Args {
 				argType := tf.info.TypeOf(arg)
 				tf.recordIgnore(argType, tf.pkg.Path())
@@ -1029,6 +1105,20 @@ func (tf *transformer) recordReflectArgs(files []*ast.File) {
 		return true
 	}
 	for _, file := range files {
+		for _, group := range file.Comments {
+			for _, comment := range group.List {
+				name := strings.TrimPrefix(comment.Text, "//export ")
+				if name == comment.Text {
+					continue
+				}
+				name = strings.TrimSpace(name)
+				obj := tf.pkg.Scope().Lookup(name)
+				if obj == nil {
+					continue // not found; skip
+				}
+				tf.ignoreObjects[obj] = true
+			}
+		}
 		ast.Inspect(file, visit)
 	}
 }
@@ -1043,19 +1133,27 @@ type transformer struct {
 	// ignoreObjects records all the objects we cannot obfuscate. An object
 	// is any named entity, such as a declared variable or type.
 	//
-	// So far, this map records:
+	// This map is initialized by prefillIgnoreObjects at the start,
+	// and extra entries from dependencies are added by transformGo,
+	// for the sake of caching type lookups.
+	// So far, it records:
 	//
-	//  * Types which are used for reflection; see recordReflectArgs.
-	//  * Identifiers used in constant expressions; see RecordUsedAsConstants.
-	//  * Identifiers used in go:linkname directives; see handleDirectives.
-	//  * Types or variables from external packages which were not
-	//    obfuscated, for caching reasons; see transformGo.
+	//  * Types which are used for reflection.
+	//  * Identifiers used in constant expressions.
+	//  * Declarations exported via "//export".
+	//  * Types or variables from external packages which were not obfuscated.
 	ignoreObjects map[types.Object]bool
 
-	// These fields are used to locate struct types from any of their field
-	// objects. Useful when obfuscating field names.
-	fieldToStruct  map[*types.Var]*types.Struct
+	// recordTypeDone helps avoid cycles in recordType.
 	recordTypeDone map[types.Type]bool
+
+	// fieldToStruct helps locate struct types from any of their field
+	// objects. Useful when obfuscating field names.
+	fieldToStruct map[*types.Var]*types.Struct
+
+	// fieldToAlias helps tell if an embedded struct field object is a type
+	// alias. Useful when obfuscating field names.
+	fieldToAlias map[*types.Var]*types.TypeName
 }
 
 // newTransformer helps initialize some maps.
@@ -1068,6 +1166,7 @@ func newTransformer() *transformer {
 		},
 		recordTypeDone: make(map[types.Type]bool),
 		fieldToStruct:  make(map[*types.Var]*types.Struct),
+		fieldToAlias:   make(map[*types.Var]*types.TypeName),
 	}
 }
 
@@ -1086,8 +1185,14 @@ func (tf *transformer) typecheck(files []*ast.File) error {
 			tf.recordType(obj.Type())
 		}
 	}
-	for _, obj := range tf.info.Uses {
+	for name, obj := range tf.info.Uses {
 		if obj != nil {
+			if obj, ok := obj.(*types.TypeName); ok && obj.IsAlias() {
+				vr, _ := tf.info.Defs[name].(*types.Var)
+				if vr != nil {
+					tf.fieldToAlias[vr] = obj
+				}
+			}
 			tf.recordType(obj.Type())
 		}
 	}
@@ -1148,25 +1253,46 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		}
 		pkg := obj.Pkg()
 		if vr, ok := obj.(*types.Var); ok && vr.Embedded() {
+
 			// The docs for ObjectOf say:
 			//
 			//     If id is an embedded struct field, ObjectOf returns the
 			//     field (*Var) it defines, not the type (*TypeName) it uses.
 			//
 			// If this embedded field is a type alias, we want to
-			// handle that instead of treating it as the type the
-			// alias points to.
+			// handle the alias's TypeName instead of treating it as
+			// the type the alias points to.
 			//
 			// Alternatively, if we don't have an alias, we want to
 			// use the embedded type, not the field.
-			if tname, ok := tf.info.Uses[node].(*types.TypeName); ok && tname.IsAlias() {
+			if tname := tf.fieldToAlias[vr]; tname != nil {
+				if !tname.IsAlias() {
+					panic("fieldToAlias recorded a non-alias TypeName?")
+				}
 				obj = tname
 			} else {
 				named := namedType(obj.Type())
 				if named == nil {
 					return true // unnamed type (probably a basic type, e.g. int)
 				}
-				obj = named.Obj()
+				// If the field embeds an alias,
+				// and the field is declared in a dependency,
+				// fieldToAlias might not tell us about the alias.
+				// We lack the *ast.Ident for the field declaration,
+				// so we can't see it in types.Info.Uses.
+				//
+				// Instead, detect such a "foreign alias embed".
+				// If we embed a final named type,
+				// but the field name does not match its name,
+				// then it must have been done via an alias.
+				// We dig out the alias's TypeName via locateForeignAlias.
+				if named.Obj().Name() != node.Name {
+					tname := locateForeignAlias(vr.Pkg().Path(), node.Name)
+					tf.fieldToAlias[vr] = tname // to reuse it later
+					obj = tname
+				} else {
+					obj = named.Obj()
+				}
 			}
 			pkg = obj.Pkg()
 		}
@@ -1178,6 +1304,14 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 			// TODO: only do this when -buildmode is plugin? what
 			// about other -buildmode options?
 			return true // could be a Go plugin API
+		}
+
+		if pkg.Path() == "embed" {
+			// The Go compiler needs to detect types such as embed.FS.
+			// That will fail if we change the import path or type name.
+			// Leave it as is.
+			// Luckily, the embed package just declares the FS type.
+			return true
 		}
 
 		// We don't want to obfuscate this object.
@@ -1195,7 +1329,7 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 		}
 		hashToUse := lpkg.GarbleActionID
 
-		// log.Printf("%#v %T", node, obj)
+		// log.Printf("%s: %#v %T", fset.Position(node.Pos()), node, obj)
 		parentScope := obj.Parent()
 		switch obj := obj.(type) {
 		case *types.Var:
@@ -1327,6 +1461,44 @@ func (tf *transformer) transformGo(file *ast.File) *ast.File {
 	return astutil.Apply(file, pre, post).(*ast.File)
 }
 
+// locateForeignAlias finds the TypeName for an alias by the name aliasName,
+// which must be declared in one of the dependencies of dependentImportPath.
+func locateForeignAlias(dependentImportPath, aliasName string) *types.TypeName {
+	var found *types.TypeName
+	lpkg, err := listPackage(dependentImportPath)
+	if err != nil {
+		panic(err) // shouldn't happen
+	}
+	for _, importedPath := range lpkg.Imports {
+		pkg2, err := origImporter.ImportFrom(importedPath, opts.GarbleDir, 0)
+		if err != nil {
+			panic(err)
+		}
+		tname, ok := pkg2.Scope().Lookup(aliasName).(*types.TypeName)
+		if ok && tname.IsAlias() {
+			if found != nil {
+				// We assume that the alias is declared exactly
+				// once in the set of direct imports.
+				// This might not be the case, e.g. if two
+				// imports declare the same alias name.
+				//
+				// TODO: Think how we could solve that
+				// efficiently, if it happens in practice.
+				panic(fmt.Sprintf("found multiple TypeNames for %s", aliasName))
+			}
+			found = tname
+		}
+	}
+	if found == nil {
+		// This should never happen.
+		// If package A embeds an alias declared in a dependency,
+		// it must show up in the form of "B.Alias",
+		// so A must import B and B must declare "Alias".
+		panic(fmt.Sprintf("could not find TypeName for %s", aliasName))
+	}
+	return found
+}
+
 // recordIgnore adds any named types (including fields) under typ to
 // ignoreObjects.
 //
@@ -1452,6 +1624,10 @@ func transformLink(args []string) ([]string, error) {
 		flags = append(flags, fmt.Sprintf("-X=%s.%s=%s", newPkg, newName, str))
 	})
 
+	// Starting in Go 1.17, Go's version is implicitly injected by the linker.
+	// It's the same method as -X, so we can override it with an extra flag.
+	flags = append(flags, "-X=runtime.buildVersion=unknown")
+
 	// Ensure we strip the -buildid flag, to not leak any build IDs for the
 	// link operation or the main package's compilation.
 	flags = flagSetValue(flags, "-buildid", "")
@@ -1490,7 +1666,7 @@ func alterTrimpath(flags []string) []string {
 	return flagSetValue(flags, "-trimpath", sharedTempDir+"=>;"+trimpath)
 }
 
-// buildFlags is obtained from 'go help build' as of Go 1.15.
+// buildFlags is obtained from 'go help build' as of Go 1.16.
 var buildFlags = map[string]bool{
 	"-a":             true,
 	"-n":             true,
@@ -1515,10 +1691,10 @@ var buildFlags = map[string]bool{
 	"-tags":          true,
 	"-trimpath":      true,
 	"-toolexec":      true,
+	"-overlay":       true,
 }
 
-// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go
-// 1.15.
+// booleanFlags is obtained from 'go help build' and 'go help testflag' as of Go 1.16.
 var booleanFlags = map[string]bool{
 	// Shared build flags.
 	"-a":          true,
@@ -1642,7 +1818,7 @@ This is likely due to go not being installed/setup correctly.
 
 How to install Go: https://golang.org/doc/install
 `, err)
-		return errJustExit
+		return errJustExit(1)
 	}
 	if err := json.Unmarshal(out, &cache.GoEnv); err != nil {
 		return err
