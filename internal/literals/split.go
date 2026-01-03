@@ -23,17 +23,14 @@ type split struct{}
 // check that the obfuscator interface is implemented
 var _ obfuscator = split{}
 
-func splitIntoRandomChunks(data []byte) [][]byte {
+func splitIntoRandomChunks(obfRand *mathrand.Rand, data []byte) [][]byte {
 	if len(data) == 1 {
 		return [][]byte{data}
 	}
 
 	var chunks [][]byte
 	for len(data) > 0 {
-		chunkSize := 1 + mathrand.Intn(maxChunkSize)
-		if chunkSize > len(data) {
-			chunkSize = len(data)
-		}
+		chunkSize := min(1+obfRand.Intn(maxChunkSize), len(data))
 
 		chunks = append(chunks, data[:chunkSize])
 		data = data[chunkSize:]
@@ -51,8 +48,8 @@ func splitIntoOneByteChunks(data []byte) [][]byte {
 
 // Shuffles the passed array and returns it back.
 // Applies for inline declaration of randomly shuffled statement arrays
-func shuffleStmts(stmts ...ast.Stmt) []ast.Stmt {
-	mathrand.Shuffle(len(stmts), func(i, j int) {
+func shuffleStmts(obfRand *mathrand.Rand, stmts ...ast.Stmt) []ast.Stmt {
+	obfRand.Shuffle(len(stmts), func(i, j int) {
 		stmts[i], stmts[j] = stmts[j], stmts[i]
 	})
 	return stmts
@@ -69,33 +66,33 @@ func encryptChunks(chunks [][]byte, op token.Token, key byte) {
 	}
 }
 
-func (split) obfuscate(data []byte) *ast.BlockStmt {
+func (split) obfuscate(rand *mathrand.Rand, data []byte, extKeys []*externalKey) *ast.BlockStmt {
 	var chunks [][]byte
 	// Short arrays should be divided into single-byte fragments
 	if len(data)/maxChunkSize < minCaseCount {
 		chunks = splitIntoOneByteChunks(data)
 	} else {
-		chunks = splitIntoRandomChunks(data)
+		chunks = splitIntoRandomChunks(rand, data)
 	}
 
 	// Generate indexes for cases chunk count + 1 decrypt case + 1 exit case
-	indexes := mathrand.Perm(len(chunks) + 2)
+	indexes := rand.Perm(len(chunks) + 2)
 
-	decryptKeyInitial := genRandByte()
+	decryptKeyInitial := byte(rand.Uint32())
 	decryptKey := decryptKeyInitial
 	// Calculate decrypt key based on indexes and position. Ignore exit index
 	for i, index := range indexes[:len(indexes)-1] {
 		decryptKey ^= byte(index * i)
 	}
 
-	op := randOperator()
+	op := randOperator(rand)
 	encryptChunks(chunks, op, decryptKey)
 
 	decryptIndex := indexes[len(indexes)-2]
 	exitIndex := indexes[len(indexes)-1]
 	switchCases := []ast.Stmt{&ast.CaseClause{
 		List: []ast.Expr{ah.IntLit(decryptIndex)},
-		Body: shuffleStmts(
+		Body: shuffleStmts(rand,
 			&ast.AssignStmt{
 				Lhs: []ast.Expr{ast.NewIdent("i")},
 				Tok: token.ASSIGN,
@@ -134,15 +131,15 @@ func (split) obfuscate(data []byte) *ast.BlockStmt {
 		}
 
 		if len(chunk) != 1 {
-			appendCallExpr.Args = append(appendCallExpr.Args, ah.StringLit(string(chunk)))
+			appendCallExpr.Args = append(appendCallExpr.Args, dataToByteSliceWithExtKeys(rand, chunk, extKeys))
 			appendCallExpr.Ellipsis = 1
 		} else {
-			appendCallExpr.Args = append(appendCallExpr.Args, ah.IntLit(int(chunk[0])))
+			appendCallExpr.Args = append(appendCallExpr.Args, byteLitWithExtKey(rand, chunk[0], extKeys, lowProb))
 		}
 
 		switchCases = append(switchCases, &ast.CaseClause{
 			List: []ast.Expr{ah.IntLit(index)},
-			Body: shuffleStmts(
+			Body: shuffleStmts(rand,
 				&ast.AssignStmt{
 					Lhs: []ast.Expr{ast.NewIdent("i")},
 					Tok: token.ASSIGN,
@@ -158,15 +155,11 @@ func (split) obfuscate(data []byte) *ast.BlockStmt {
 	}
 
 	return ah.BlockStmt(
-		&ast.DeclStmt{Decl: &ast.GenDecl{
-			Tok: token.VAR,
-			Specs: []ast.Spec{
-				&ast.ValueSpec{
-					Names: []*ast.Ident{ast.NewIdent("data")},
-					Type:  &ast.ArrayType{Elt: ast.NewIdent("byte")},
-				},
-			},
-		}},
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{ast.NewIdent("data")},
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{ah.CallExpr(ast.NewIdent("make"), &ast.ArrayType{Elt: ast.NewIdent("byte")}, ah.IntLit(0), ah.IntLit(len(data)+1))},
+		},
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("i")},
 			Tok: token.DEFINE,
@@ -175,7 +168,7 @@ func (split) obfuscate(data []byte) *ast.BlockStmt {
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("decryptKey")},
 			Tok: token.DEFINE,
-			Rhs: []ast.Expr{ah.IntLit(int(decryptKeyInitial))},
+			Rhs: []ast.Expr{ah.CallExprByName("int", byteLitWithExtKey(rand, decryptKeyInitial, extKeys, normalProb))},
 		},
 		&ast.ForStmt{
 			Init: &ast.AssignStmt{
@@ -206,7 +199,7 @@ func (split) obfuscate(data []byte) *ast.BlockStmt {
 				},
 				&ast.SwitchStmt{
 					Tag:  ast.NewIdent("i"),
-					Body: ah.BlockStmt(shuffleStmts(switchCases...)...),
+					Body: ah.BlockStmt(shuffleStmts(rand, switchCases...)...),
 				}),
 		},
 	)

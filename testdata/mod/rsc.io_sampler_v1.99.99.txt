@@ -1,4 +1,4 @@
-rsc.io/sampler@v1.99.99
+module rsc.io/sampler@v1.99.99
 
 -- .mod --
 module "rsc.io/sampler"
@@ -138,3 +138,7 @@ func (t *text) find(prefs []language.Tag) string {
 	}
 	return s
 }
+-- unchanged/unchanged.go --
+package unchanged
+
+const Foo = 4

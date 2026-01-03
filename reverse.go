@@ -8,45 +8,43 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/types"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
 // commandReverse implements "garble reverse".
 func commandReverse(args []string) error {
 	flags, args := splitFlagsFromArgs(args)
-	if hasHelpFlag(flags) {
-		fmt.Fprintf(os.Stderr, "usage: garble [garble flags] reverse [files]\n")
+	if hasHelpFlag(flags) || len(args) == 0 {
+		fmt.Fprint(os.Stderr, `
+usage: garble [garble flags] reverse [build flags] package [files]
+
+For example, after building an obfuscated program as follows:
+
+	garble -literals build -tags=mytag ./cmd/mycmd
+
+One can reverse a captured panic stack trace as follows:
+
+	garble -literals reverse -tags=mytag ./cmd/mycmd panic-output.txt
+`[1:])
 		return errJustExit(2)
 	}
 
-	mainPkg := "."
-	if len(args) > 0 {
-		mainPkg = args[0]
-		args = args[1:]
-	}
-
-	listArgs := []string{
-		"-json",
-		"-deps",
-		"-export",
-	}
-	listArgs = append(listArgs, flags...)
-	listArgs = append(listArgs, mainPkg)
-	// TODO: We most likely no longer need this "list -toolexec" call, since
-	// we use the original build IDs.
-	if _, err := toolexecCmd("list", listArgs); err != nil {
+	pkg, args := args[0], args[1:]
+	// We don't actually run `go list -toolexec=garble`; we only use toolexecCmd
+	// to ensure that sharedCache.ListedPackages is filled.
+	_, err := toolexecCmd("list", append(flags, pkg))
+	defer os.RemoveAll(os.Getenv("GARBLE_SHARED"))
+	if err != nil {
 		return err
 	}
 
 	// We don't actually run a main Go command with all flags,
 	// so if the user gave a non-build flag,
 	// we need this check to not silently ignore it.
-	if _, firstUnknown := filterBuildFlags(flags); firstUnknown != "" {
+	if _, firstUnknown := filterForwardBuildFlags(flags); firstUnknown != "" {
 		// A bit of a hack to get a normal flag.Parse error.
 		// Longer term, "reverse" might have its own FlagSet.
 		return flag.NewFlagSet("", flag.ContinueOnError).Parse([]string{firstUnknown})
@@ -59,66 +57,64 @@ func commandReverse(args []string) error {
 	// so it's unnecessary to try to avoid this cost.
 	var replaces []string
 
-	for _, lpkg := range cache.ListedPackages {
-		if !lpkg.Private {
+	for _, lpkg := range sharedCache.ListedPackages {
+		if !lpkg.ToObfuscate {
 			continue
 		}
-		curPkg = lpkg
-
-		addReplace := func(hash []byte, str string) {
-			if hash == nil {
-				hash = lpkg.GarbleActionID
-			}
-			replaces = append(replaces, hashWith(hash, str), str)
+		addHashedWithPackage := func(str string) {
+			replaces = append(replaces, hashWithPackage(lpkg, str), str)
 		}
 
 		// Package paths are obfuscated, too.
-		addReplace(nil, lpkg.ImportPath)
+		addHashedWithPackage(lpkg.ImportPath)
 
-		var files []*ast.File
-		for _, goFile := range lpkg.GoFiles {
-			fullGoFile := filepath.Join(lpkg.Dir, goFile)
-			file, err := parser.ParseFile(fset, fullGoFile, nil, 0)
-			if err != nil {
-				return err
-			}
-			files = append(files, file)
+		// Assembly filenames are obfuscated in a simple way.
+		// Mirroring [transformer.transformAsm]; note the lack of a test
+		// as so far this has only mattered for build errors with positions.
+		for _, name := range lpkg.SFiles {
+			newName := hashWithPackage(lpkg, name) + ".s"
+			replaces = append(replaces, newName, name)
 		}
-		tf := newTransformer()
-		if err := tf.typecheck(files); err != nil {
+
+		files, err := parseFiles(lpkg, lpkg.Dir, lpkg.CompiledGoFiles)
+		if err != nil {
 			return err
 		}
+		origImporter := importerForPkg(lpkg)
+		_, info, err := typecheck(lpkg.ImportPath, files, origImporter)
+		if err != nil {
+			return err
+		}
+		fieldToStruct := computeFieldToStruct(info)
 		for i, file := range files {
-			goFile := lpkg.GoFiles[i]
-			ast.Inspect(file, func(node ast.Node) bool {
+			goFile := lpkg.CompiledGoFiles[i]
+			for node := range ast.Preorder(file) {
 				switch node := node.(type) {
 
 				// Replace names.
 				// TODO: do var names ever show up in output?
 				case *ast.FuncDecl:
-					addReplace(nil, node.Name.Name)
+					addHashedWithPackage(node.Name.Name)
 				case *ast.TypeSpec:
-					addReplace(nil, node.Name.Name)
+					addHashedWithPackage(node.Name.Name)
 				case *ast.Field:
 					for _, name := range node.Names {
-						obj, _ := tf.info.ObjectOf(name).(*types.Var)
+						obj, _ := info.ObjectOf(name).(*types.Var)
 						if obj == nil || !obj.IsField() {
 							continue
 						}
-						strct := tf.fieldToStruct[obj]
+						strct := fieldToStruct[obj]
 						if strct == nil {
-							panic("could not find for " + name.Name)
+							panic("could not find struct for field " + name.Name)
 						}
-						fieldsHash := []byte(strct.String())
-						hashToUse := addGarbleToHash(fieldsHash)
-						addReplace(hashToUse, name.Name)
+						replaces = append(replaces, hashWithStruct(strct, obj), name.Name)
 					}
 
 				case *ast.CallExpr:
 					// Reverse position information of call sites.
 					pos := fset.Position(node.Pos())
 					origPos := fmt.Sprintf("%s:%d", goFile, pos.Offset)
-					newFilename := hashWith(lpkg.GarbleActionID, origPos) + ".go"
+					newFilename := hashWithPackage(lpkg, origPos) + ".go"
 
 					// Do "obfuscated.go:1", corresponding to the call site's line.
 					// Most common in stack traces.
@@ -137,9 +133,7 @@ func commandReverse(args []string) error {
 						fmt.Sprintf("%s/%s", lpkg.ImportPath, goFile),
 					)
 				}
-
-				return true
-			})
+			}
 		}
 	}
 	repl := strings.NewReplacer(replaces...)
@@ -162,11 +156,11 @@ func commandReverse(args []string) error {
 			return err
 		}
 		defer f.Close()
-		any, err := reverseContent(os.Stdout, f, repl)
+		modified, err := reverseContent(os.Stdout, f, repl)
 		if err != nil {
 			return err
 		}
-		anyModified = anyModified || any
+		anyModified = anyModified || modified
 		f.Close() // since we're in a loop
 	}
 	if !anyModified {

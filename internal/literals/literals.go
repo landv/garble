@@ -6,165 +6,177 @@ package literals
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	mathrand "math/rand"
-	"strconv"
 
 	"golang.org/x/tools/go/ast/astutil"
 	ah "mvdan.cc/garble/internal/asthelper"
 )
 
-// maxSizeBytes is the limit, in bytes, of the size of string-like literals
-// which we will obfuscate. This is important, because otherwise garble can take
-// a very long time to obfuscate huge code-generated literals, such as those
-// corresponding to large assets.
-//
-// Note that this is the size of the literal in source code. For example, "\xab"
-// counts as four bytes.
-//
-// If someone truly wants to obfuscate those, they should do that when they
-// generate the code, not at build time. Plus, with Go 1.16 that technique
-// should largely stop being used.
-const maxSizeBytes = 2 << 10 // KiB
+// MinSize is the lower bound limit, of the size of string-like literals
+// which we will obfuscate. This is needed in order for binary size to stay relatively
+// moderate, this also decreases the likelihood for performance slowdowns.
+const MinSize = 8
 
-func randObfuscator() obfuscator {
-	randPos := mathrand.Intn(len(obfuscators))
-	return obfuscators[randPos]
-}
+// maxSize is the upper limit of the size of string-like literals
+// which we will obfuscate with any of the available obfuscators.
+// Beyond that we apply only a subset of obfuscators which are guaranteed to run efficiently.
+const maxSize = 2 << 10 // KiB
+
+const (
+	// minStringJunkBytes defines the minimum number of junk bytes to prepend or append during string obfuscation.
+	minStringJunkBytes = 2
+	// maxStringJunkBytes defines the maximum number of junk bytes to prepend or append during string obfuscation.
+	maxStringJunkBytes = 8
+)
+
+// NameProviderFunc defines a function type that generates a string based on a random source and a base name.
+type NameProviderFunc func(rand *mathrand.Rand, baseName string) string
 
 // Obfuscate replaces literals with obfuscated anonymous functions.
-func Obfuscate(file *ast.File, info *types.Info, fset *token.FileSet, ignoreObj map[types.Object]bool) *ast.File {
+func Obfuscate(rand *mathrand.Rand, file *ast.File, info *types.Info, linkStrings map[*types.Var]string, nameFunc NameProviderFunc) *ast.File {
+	obfRand := newObfRand(rand, file, nameFunc)
 	pre := func(cursor *astutil.Cursor) bool {
-		switch x := cursor.Node().(type) {
+		switch node := cursor.Node().(type) {
 		case *ast.GenDecl:
-			if x.Tok != token.CONST {
-				return true
+			// constants are obfuscated by replacing all references with the obfuscated value
+			if node.Tok == token.CONST {
+				return false
 			}
-			for _, spec := range x.Specs {
-				spec := spec.(*ast.ValueSpec) // guaranteed for Tok==CONST
-				if len(spec.Values) == 0 {
-					// skip constants with inferred values
+		case *ast.ValueSpec:
+			for _, name := range node.Names {
+				obj := info.Defs[name].(*types.Var)
+				if _, e := linkStrings[obj]; e {
+					// Skip this entire ValueSpec to not break -ldflags=-X.
+					// TODO: support obfuscating those injected strings, too.
 					return false
 				}
-
-				for _, name := range spec.Names {
-					obj := info.ObjectOf(name)
-
-					// We only obfuscate const declarations with typed string values.
-					if obj.Type() != types.Typ[types.String] {
-						return false
-					}
-
-					// The object cannot be obfuscated, e.g. a value that needs to be constant
-					if ignoreObj[obj] {
-						return false
-					}
-				}
 			}
-
-			x.Tok = token.VAR
-			// constants are not possible if we want to obfuscate literals, therefore
-			// move all constant blocks which only contain strings to variables
 		}
 		return true
 	}
 
 	post := func(cursor *astutil.Cursor) bool {
-		switch x := cursor.Node().(type) {
-		case *ast.CompositeLit:
-			byteType := types.Universe.Lookup("byte").Type()
+		node, ok := cursor.Node().(ast.Expr)
+		if !ok {
+			return true
+		}
 
-			if len(x.Elts) == 0 || len(x.Elts) > maxSizeBytes {
+		typeAndValue := info.Types[node]
+		if !typeAndValue.IsValue() {
+			return true
+		}
+
+		if typeAndValue.Type == types.Typ[types.String] && typeAndValue.Value != nil {
+			value := constant.StringVal(typeAndValue.Value)
+			if len(value) < MinSize {
 				return true
 			}
 
-			var arrayLen int64
-			switch y := info.TypeOf(x.Type).(type) {
-			case *types.Array:
-				if y.Elem() != byteType {
-					return true
-				}
-
-				arrayLen = y.Len()
-
-			case *types.Slice:
-				if y.Elem() != byteType {
-					return true
-				}
-
-			default:
-				return true
-			}
-
-			data := make([]byte, 0, len(x.Elts))
-
-			for _, el := range x.Elts {
-				lit, ok := el.(*ast.BasicLit)
-				if !ok {
-					return true
-				}
-				var value byte
-				if lit.Kind == token.CHAR {
-					val, err := strconv.Unquote(lit.Value)
-					if err != nil {
-						panic(fmt.Sprintf("cannot unquote character: %v", err))
-					}
-
-					value = byte(val[0])
-				} else {
-					val, err := strconv.ParseUint(lit.Value, 0, 8)
-					if err != nil {
-						panic(fmt.Sprintf("cannot parse integer: %v", err))
-					}
-
-					value = byte(val)
-				}
-
-				data = append(data, value)
-			}
-
-			if arrayLen > 0 {
-				cursor.Replace(withPos(obfuscateByteArray(data, arrayLen), x.Pos()))
-			} else {
-				cursor.Replace(withPos(obfuscateByteSlice(data), x.Pos()))
-			}
+			cursor.Replace(withPos(obfuscateString(obfRand, value), node.Pos()))
 
 			return true
+		}
 
-		case *ast.BasicLit:
-			switch cursor.Name() {
-			case "Values", "Rhs", "Value", "Args", "X", "Y", "Results", "Elts":
-			default:
-				return true // we don't want to obfuscate imports etc.
-			}
+		switch node := node.(type) {
+		case *ast.UnaryExpr:
+			// Account for the possibility of address operators like
+			// &[]byte used inline with function arguments.
+			//
+			// See issue #520.
 
-			if x.Kind != token.STRING {
-				return true
-			}
-			if len(x.Value) > maxSizeBytes {
-				return true
-			}
-			typeInfo := info.TypeOf(x)
-			if typeInfo != types.Typ[types.String] && typeInfo != types.Typ[types.UntypedString] {
-				return true
-			}
-			value, err := strconv.Unquote(x.Value)
-			if err != nil {
-				panic(fmt.Sprintf("cannot unquote string: %v", err))
-			}
-
-			if len(value) == 0 {
+			if node.Op != token.AND {
 				return true
 			}
 
-			cursor.Replace(withPos(obfuscateString(value), x.Pos()))
+			if child, ok := node.X.(*ast.CompositeLit); ok {
+				newnode := handleCompositeLiteral(obfRand, true, child, info)
+				if newnode != nil {
+					cursor.Replace(newnode)
+				}
+			}
+
+		case *ast.CompositeLit:
+			// We replaced the &[]byte{...} case above. Here we account for the
+			// standard []byte{...} or [4]byte{...} value form.
+			//
+			// We need two separate calls to cursor.Replace, as it only supports
+			// replacing the node we're currently visiting, and the pointer variant
+			// requires us to move the ampersand operator.
+
+			parent, ok := cursor.Parent().(*ast.UnaryExpr)
+			if ok && parent.Op == token.AND {
+				return true
+			}
+
+			newnode := handleCompositeLiteral(obfRand, false, node, info)
+			if newnode != nil {
+				cursor.Replace(newnode)
+			}
 		}
 
 		return true
 	}
 
-	return astutil.Apply(file, pre, post).(*ast.File)
+	newFile := astutil.Apply(file, pre, post).(*ast.File)
+	obfRand.proxyDispatcher.AddToFile(newFile)
+	return newFile
+}
+
+// handleCompositeLiteral checks if the input node is []byte or [...]byte and
+// calls the appropriate obfuscation method, returning a new node that should
+// be used to replace it.
+//
+// If the input node cannot be obfuscated nil is returned.
+func handleCompositeLiteral(obfRand *obfRand, isPointer bool, node *ast.CompositeLit, info *types.Info) ast.Node {
+	if len(node.Elts) < MinSize {
+		return nil
+	}
+
+	byteType := types.Universe.Lookup("byte").Type()
+
+	var arrayLen int64
+	switch y := info.TypeOf(node.Type).(type) {
+	case *types.Array:
+		if y.Elem() != byteType {
+			return nil
+		}
+
+		arrayLen = y.Len()
+
+	case *types.Slice:
+		if y.Elem() != byteType {
+			return nil
+		}
+
+	default:
+		return nil
+	}
+
+	data := make([]byte, 0, len(node.Elts))
+
+	for _, el := range node.Elts {
+		elType := info.Types[el]
+
+		if elType.Value == nil || elType.Value.Kind() != constant.Int {
+			return nil
+		}
+
+		value, ok := constant.Uint64Val(elType.Value)
+		if !ok {
+			panic(fmt.Sprintf("cannot parse byte value: %v", elType.Value))
+		}
+
+		data = append(data, byte(value))
+	}
+
+	if arrayLen > 0 {
+		return withPos(obfuscateByteArray(obfRand, isPointer, data, arrayLen), node.Pos())
+	}
+
+	return withPos(obfuscateByteSlice(obfRand, isPointer, data), node.Pos())
 }
 
 // withPos sets any token.Pos fields under node which affect printing to pos.
@@ -175,7 +187,7 @@ func Obfuscate(file *ast.File, info *types.Info, fset *token.FileSet, ignoreObj 
 //
 // We don't set any "end" or middle positions, because they seem irrelevant.
 func withPos(node ast.Node, pos token.Pos) ast.Node {
-	ast.Inspect(node, func(node ast.Node) bool {
+	for node := range ast.Preorder(node) {
 		switch node := node.(type) {
 		case *ast.BasicLit:
 			node.ValuePos = pos
@@ -207,35 +219,92 @@ func withPos(node ast.Node, pos token.Pos) ast.Node {
 		case *ast.BranchStmt:
 			node.TokPos = pos
 		}
-		return true
-	})
+	}
 	return node
 }
 
-func obfuscateString(data string) *ast.CallExpr {
-	obfuscator := randObfuscator()
-	block := obfuscator.obfuscate([]byte(data))
+func obfuscateString(obfRand *obfRand, data string) *ast.CallExpr {
+	obf := getNextObfuscator(obfRand, len(data))
 
-	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(ast.NewIdent("string"), ast.NewIdent("data"))))
+	// Generate junk bytes to to prepend and append to the data.
+	// This is to prevent the obfuscated string from being easily fingerprintable.
+	junkBytes := make([]byte, obfRand.Intn(maxStringJunkBytes-minStringJunkBytes)+minStringJunkBytes)
+	obfRand.Read(junkBytes)
+	splitIdx := obfRand.Intn(len(junkBytes))
 
-	return ah.LambdaCall(ast.NewIdent("string"), block)
-}
+	extKeys := randExtKeys(obfRand.Rand)
 
-func obfuscateByteSlice(data []byte) *ast.CallExpr {
-	obfuscator := randObfuscator()
-	block := obfuscator.obfuscate(data)
-	block.List = append(block.List, ah.ReturnStmt(ast.NewIdent("data")))
-	return ah.LambdaCall(&ast.ArrayType{Elt: ast.NewIdent("byte")}, block)
-}
+	plainData := []byte(data)
+	plainDataWithJunkBytes := append(append(junkBytes[:splitIdx], plainData...), junkBytes[splitIdx:]...)
 
-func obfuscateByteArray(data []byte, length int64) *ast.CallExpr {
-	obfuscator := randObfuscator()
-	block := obfuscator.obfuscate(data)
+	block := obf.obfuscate(obfRand.Rand, plainDataWithJunkBytes, extKeys)
+	params, args := extKeysToParams(obfRand, extKeys)
 
-	arrayType := &ast.ArrayType{
-		Len: ah.IntLit(int(length)),
-		Elt: ast.NewIdent("byte"),
+	// Generate unique cast bytes to string function and hide it using proxyDispatcher:
+	//
+	// func(x []byte) string {
+	//		return string(x[<splitIdx>:<splitIdx+len(plainData)>])
+	//	}
+	funcTyp := &ast.FuncType{
+		Params: &ast.FieldList{List: []*ast.Field{{
+			Type: ah.ByteSliceType(),
+		}}},
+		Results: &ast.FieldList{List: []*ast.Field{{
+			Type: ast.NewIdent("string"),
+		}}},
 	}
+	funcVal := &ast.FuncLit{
+		Type: &ast.FuncType{
+			Params: &ast.FieldList{List: []*ast.Field{{
+				Names: []*ast.Ident{ast.NewIdent("x")},
+				Type:  ah.ByteSliceType(),
+			}}},
+			Results: &ast.FieldList{List: []*ast.Field{{
+				Type: ast.NewIdent("string"),
+			}}},
+		},
+		Body: ah.BlockStmt(
+			ah.ReturnStmt(
+				ah.CallExprByName("string",
+					&ast.SliceExpr{
+						X:    ast.NewIdent("x"),
+						Low:  ah.IntLit(splitIdx),
+						High: ah.IntLit(splitIdx + len(plainData)),
+					},
+				),
+			),
+		),
+	}
+	block.List = append(block.List, ah.ReturnStmt(ah.CallExpr(obfRand.proxyDispatcher.HideValue(funcVal, funcTyp), ast.NewIdent("data"))))
+	return ah.LambdaCall(params, ast.NewIdent("string"), block, args)
+}
+
+func obfuscateByteSlice(obfRand *obfRand, isPointer bool, data []byte) *ast.CallExpr {
+	obf := getNextObfuscator(obfRand, len(data))
+
+	extKeys := randExtKeys(obfRand.Rand)
+	block := obf.obfuscate(obfRand.Rand, data, extKeys)
+	params, args := extKeysToParams(obfRand, extKeys)
+
+	if isPointer {
+		block.List = append(block.List, ah.ReturnStmt(
+			ah.UnaryExpr(token.AND, ast.NewIdent("data")),
+		))
+		return ah.LambdaCall(params, ah.StarExpr(ah.ByteSliceType()), block, args)
+	}
+
+	block.List = append(block.List, ah.ReturnStmt(ast.NewIdent("data")))
+	return ah.LambdaCall(params, ah.ByteSliceType(), block, args)
+}
+
+func obfuscateByteArray(obfRand *obfRand, isPointer bool, data []byte, length int64) *ast.CallExpr {
+	obf := getNextObfuscator(obfRand, len(data))
+
+	extKeys := randExtKeys(obfRand.Rand)
+	block := obf.obfuscate(obfRand.Rand, data, extKeys)
+	params, args := extKeysToParams(obfRand, extKeys)
+
+	arrayType := ah.ByteArrayType(length)
 
 	sliceToArray := []ast.Stmt{
 		&ast.DeclStmt{
@@ -251,68 +320,34 @@ func obfuscateByteArray(data []byte, length int64) *ast.CallExpr {
 			Key: ast.NewIdent("i"),
 			Tok: token.DEFINE,
 			X:   ast.NewIdent("data"),
-			Body: &ast.BlockStmt{List: []ast.Stmt{
-				&ast.AssignStmt{
-					Lhs: []ast.Expr{ah.IndexExpr("newdata", ast.NewIdent("i"))},
-					Tok: token.ASSIGN,
-					Rhs: []ast.Expr{ah.IndexExpr("data", ast.NewIdent("i"))},
-				},
-			}},
+			Body: ah.BlockStmt(
+				ah.AssignStmt(
+					ah.IndexExprByExpr(ast.NewIdent("newdata"), ast.NewIdent("i")),
+					ah.IndexExprByExpr(ast.NewIdent("data"), ast.NewIdent("i")),
+				),
+			),
 		},
-		ah.ReturnStmt(ast.NewIdent("newdata")),
 	}
 
+	var retexpr ast.Expr = ast.NewIdent("newdata")
+	if isPointer {
+		retexpr = ah.UnaryExpr(token.AND, retexpr)
+	}
+
+	sliceToArray = append(sliceToArray, ah.ReturnStmt(retexpr))
 	block.List = append(block.List, sliceToArray...)
 
-	return ah.LambdaCall(arrayType, block)
-}
-
-// RecordUsedAsConstants records identifiers used in constant expressions.
-func RecordUsedAsConstants(node ast.Node, info *types.Info, ignoreObj map[types.Object]bool) {
-	visit := func(node ast.Node) bool {
-		ident, ok := node.(*ast.Ident)
-		if !ok {
-			return true
-		}
-
-		// Only record *types.Const objects.
-		// Other objects, such as builtins or type names,
-		// must not be recorded as they would be false positives.
-		obj := info.ObjectOf(ident)
-		if _, ok := obj.(*types.Const); ok {
-			ignoreObj[obj] = true
-		}
-
-		return true
+	if isPointer {
+		return ah.LambdaCall(params, ah.StarExpr(arrayType), block, args)
 	}
 
-	switch x := node.(type) {
-	// in a slice or array composite literal all explicit keys must be constant representable
-	case *ast.CompositeLit:
-		if _, ok := x.Type.(*ast.ArrayType); !ok {
-			break
-		}
-		for _, elt := range x.Elts {
-			if kv, ok := elt.(*ast.KeyValueExpr); ok {
-				ast.Inspect(kv.Key, visit)
-			}
-		}
-	// in an array type the length must be a constant representable
-	case *ast.ArrayType:
-		if x.Len != nil {
-			ast.Inspect(x.Len, visit)
-		}
-	// in a const declaration all values must be constant representable
-	case *ast.GenDecl:
-		if x.Tok != token.CONST {
-			break
-		}
-		for _, spec := range x.Specs {
-			spec := spec.(*ast.ValueSpec)
+	return ah.LambdaCall(params, arrayType, block, args)
+}
 
-			for _, val := range spec.Values {
-				ast.Inspect(val, visit)
-			}
-		}
+func getNextObfuscator(obfRand *obfRand, size int) obfuscator {
+	if size <= maxSize {
+		return obfRand.nextObfuscator()
+	} else {
+		return obfRand.nextLinearTimeObfuscator()
 	}
 }

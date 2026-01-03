@@ -16,21 +16,37 @@ type shuffle struct{}
 // check that the obfuscator interface is implemented
 var _ obfuscator = shuffle{}
 
-func (shuffle) obfuscate(data []byte) *ast.BlockStmt {
+func (shuffle) obfuscate(rand *mathrand.Rand, data []byte, extKeys []*externalKey) *ast.BlockStmt {
 	key := make([]byte, len(data))
-	genRandBytes(key)
+	rand.Read(key)
+
+	const (
+		minIdxKeySize = 2
+		maxIdxKeySize = 16
+	)
+
+	idxKeySize := minIdxKeySize
+	if tmp := rand.Intn(len(data)); tmp > idxKeySize {
+		idxKeySize = tmp
+	}
+	if idxKeySize > maxIdxKeySize {
+		idxKeySize = maxIdxKeySize
+	}
+
+	idxKey := make([]byte, idxKeySize)
+	rand.Read(idxKey)
 
 	fullData := make([]byte, len(data)+len(key))
 	operators := make([]token.Token, len(fullData))
 	for i := range operators {
-		operators[i] = randOperator()
+		operators[i] = randOperator(rand)
 	}
 
 	for i, b := range key {
 		fullData[i], fullData[i+len(data)] = evalOperator(operators[i], data[i], b), b
 	}
 
-	shuffledIdxs := mathrand.Perm(len(fullData))
+	shuffledIdxs := rand.Perm(len(fullData))
 
 	shuffledFullData := make([]byte, len(fullData))
 	for i, b := range fullData {
@@ -39,10 +55,13 @@ func (shuffle) obfuscate(data []byte) *ast.BlockStmt {
 
 	args := []ast.Expr{ast.NewIdent("data")}
 	for i := range data {
+		keyIdx := rand.Intn(idxKeySize)
+		k := int(idxKey[keyIdx])
+
 		args = append(args, operatorToReversedBinaryExpr(
 			operators[i],
-			ah.IndexExpr("fullData", ah.IntLit(shuffledIdxs[i])),
-			ah.IndexExpr("fullData", ah.IntLit(shuffledIdxs[len(data)+i])),
+			ah.IndexExpr("fullData", &ast.BinaryExpr{X: ah.IntLit(shuffledIdxs[i] ^ k), Op: token.XOR, Y: ah.CallExprByName("int", ah.IndexExpr("idxKey", ah.IntLit(keyIdx)))}),
+			ah.IndexExpr("fullData", &ast.BinaryExpr{X: ah.IntLit(shuffledIdxs[len(data)+i] ^ k), Op: token.XOR, Y: ah.CallExprByName("int", ah.IndexExpr("idxKey", ah.IntLit(keyIdx)))}),
 		))
 	}
 
@@ -50,16 +69,17 @@ func (shuffle) obfuscate(data []byte) *ast.BlockStmt {
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("fullData")},
 			Tok: token.DEFINE,
-			Rhs: []ast.Expr{ah.DataToByteSlice(shuffledFullData)},
+			Rhs: []ast.Expr{dataToByteSliceWithExtKeys(rand, shuffledFullData, extKeys)},
 		},
-		&ast.DeclStmt{
-			Decl: &ast.GenDecl{
-				Tok: token.VAR,
-				Specs: []ast.Spec{&ast.ValueSpec{
-					Names: []*ast.Ident{ast.NewIdent("data")},
-					Type:  &ast.ArrayType{Elt: ast.NewIdent("byte")},
-				}},
-			},
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{ast.NewIdent("idxKey")},
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{dataToByteSliceWithExtKeys(rand, idxKey, extKeys)},
+		},
+		&ast.AssignStmt{
+			Lhs: []ast.Expr{ast.NewIdent("data")},
+			Tok: token.DEFINE,
+			Rhs: []ast.Expr{ah.CallExpr(ast.NewIdent("make"), &ast.ArrayType{Elt: ast.NewIdent("byte")}, ah.IntLit(0), ah.IntLit(len(data)+1))},
 		},
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("data")},

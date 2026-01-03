@@ -7,143 +7,140 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/printer"
+	"go/scanner"
+	"go/token"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
-func isDirective(text string) bool {
-	return strings.HasPrefix(text, "//go:") || strings.HasPrefix(text, "// +build")
-}
+var printBuf1, printBuf2 bytes.Buffer
 
 // printFile prints a Go file to a buffer, while also removing non-directive
-// comments and adding extra compiler directives to obfuscate position
-// information.
-func printFile(file1 *ast.File) ([]byte, error) {
-	printConfig := printer.Config{Mode: printer.RawFormat}
+// comments and adding extra compiler directives to obfuscate position information.
+func printFile(lpkg *listedPackage, file *ast.File) ([]byte, error) {
+	if lpkg.ToObfuscate {
+		// Omit comments from the final Go code.
+		// Keep directives, as they affect the build.
+		// We do this before printing to print fewer bytes below.
+		var newComments []*ast.CommentGroup
+		for _, group := range file.Comments {
+			var newGroup ast.CommentGroup
+			for _, comment := range group.List {
+				if strings.HasPrefix(comment.Text, "//go:") {
+					newGroup.List = append(newGroup.List, comment)
+				}
+			}
+			if len(newGroup.List) > 0 {
+				newComments = append(newComments, &newGroup)
+			}
+		}
+		file.Comments = newComments
+	}
 
-	var buf1 bytes.Buffer
-	if err := printConfig.Fprint(&buf1, fset, file1); err != nil {
+	printBuf1.Reset()
+	printConfig := printer.Config{Mode: printer.RawFormat}
+	if err := printConfig.Fprint(&printBuf1, fset, file); err != nil {
 		return nil, err
 	}
-	src := buf1.Bytes()
+	src := printBuf1.Bytes()
 
-	if !curPkg.Private {
-		// TODO(mvdan): make transformCompile handle non-private
-		// packages like runtime earlier on, to remove these checks.
+	if !lpkg.ToObfuscate {
+		// We lightly transform packages which shouldn't be obfuscated,
+		// such as when rewriting go:linkname directives to obfuscated packages.
+		// We still need to print the files, but without obfuscating positions.
 		return src, nil
 	}
 
-	absFilename := fset.Position(file1.Pos()).Filename
-	filename := filepath.Base(absFilename)
+	fsetFile := fset.File(file.Pos())
+	filename := filepath.Base(fsetFile.Name())
+	newPrefix := ""
 	if strings.HasPrefix(filename, "_cgo_") {
-		// cgo-generated files don't need changed line numbers.
-		// Plus, the compiler can complain rather easily.
-		return src, nil
+		newPrefix = "_cgo_"
 	}
 
 	// Many parts of garble, notably the literal obfuscator, modify the AST.
 	// Unfortunately, comments are free-floating in File.Comments,
 	// and those are the only source of truth that go/printer uses.
 	// So the positions of the comments in the given file are wrong.
-	// The only way we can get the final ones is to parse again.
-	//
-	// We use an empty filename here.
-	// Syntax errors should be rare, and when they do happen,
-	// we don't want to point to the original source file on disk.
-	// That would be confusing, as we've changed the source in memory.
-	file2, err := parser.ParseFile(fset, "", src, parser.ParseComments)
-	if err != nil {
-		return nil, fmt.Errorf("re-parse error: %w", err)
-	}
+	// The only way we can get the final ones is to tokenize again.
+	// Using go/scanner is slightly awkward, but cheaper than parsing again.
 
-	// Keep the compiler directives, and change position info.
-	type commentToAdd struct {
-		offset int
-		text   string
-	}
-	var toAdd []commentToAdd
-	addComment := func(offset int, text string) {
-		toAdd = append(toAdd, commentToAdd{offset, text})
-	}
-
-	// Remove any comments by making them whitespace.
-	// Keep directives, as they affect the build.
-	// This is superior to removing the comments before printing,
-	// because then the final source would have different line numbers.
-	for _, group := range file2.Comments {
-		for _, comment := range group.List {
-			if isDirective(comment.Text) {
-				continue
-			}
-			start := fset.Position(comment.Pos()).Offset
-			end := fset.Position(comment.End()).Offset
-			for i := start; i < end; i++ {
-				src[i] = ' '
-			}
+	// We want to use the original positions for the hashed positions.
+	// Since later we'll iterate on tokens rather than walking an AST,
+	// we use a list of offsets indexed by identifiers in source order.
+	var origCallOffsets []int
+	nextOffset := -1
+	for node := range ast.Preorder(file) {
+		switch node := node.(type) {
+		case *ast.CallExpr:
+			nextOffset = fsetFile.Position(node.Pos()).Offset
+		case *ast.Ident:
+			origCallOffsets = append(origCallOffsets, nextOffset)
+			nextOffset = -1
 		}
 	}
-
-	var origCallExprs []*ast.CallExpr
-	ast.Inspect(file1, func(node ast.Node) bool {
-		if node, ok := node.(*ast.CallExpr); ok {
-			origCallExprs = append(origCallExprs, node)
-		}
-		return true
-	})
-
-	i := 0
-	ast.Inspect(file2, func(node ast.Node) bool {
-		node, ok := node.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		origNode := origCallExprs[i]
-		i++
-		newName := ""
-		if !opts.Tiny {
-			origPos := fmt.Sprintf("%s:%d", filename, fset.Position(origNode.Pos()).Offset)
-			newName = hashWith(curPkg.GarbleActionID, origPos) + ".go"
-			// log.Printf("%q hashed with %x to %q", origPos, curPkg.GarbleActionID, newName)
-		}
-		newPos := fmt.Sprintf("%s:1", newName)
-		pos := fset.Position(node.Pos())
-
-		// We use the "/*text*/" form, since we can use multiple of them
-		// on a single line, and they don't require extra newlines.
-		addComment(pos.Offset, "/*line "+newPos+"*/")
-		return true
-	})
-
-	// We add comments in order.
-	sort.Slice(toAdd, func(i, j int) bool {
-		return toAdd[i].offset < toAdd[j].offset
-	})
 
 	copied := 0
-	var buf2 bytes.Buffer
+	printBuf2.Reset()
 
 	// Make sure the entire file gets a zero filename by default,
 	// in case we miss any positions below.
 	// We use a //-style comment, because there might be build tags.
-	// addComment is for /*-style comments, so add it to buf2 directly.
-	buf2.WriteString("//line :1\n")
+	fmt.Fprintf(&printBuf2, "//line %s:1\n", newPrefix)
 
-	for _, comment := range toAdd {
-		buf2.Write(src[copied:comment.offset])
-		copied = comment.offset
+	// We use an empty filename when tokenizing below.
+	// We use a nil go/scanner.ErrorHandler because src comes from go/printer.
+	// Syntax errors should be rare, and when they do happen,
+	// we don't want to point to the original source file on disk.
+	// That would be confusing, as we've changed the source in memory.
+	var s scanner.Scanner
+	fsetFile = fset.AddFile("", fset.Base(), len(src))
+	s.Init(fsetFile, src, nil, scanner.ScanComments)
 
-		// We assume that all comments are of the form "/*text*/".
-		// Make sure there is whitespace at either side of a comment.
-		// Otherwise, we could change the syntax of the program.
-		// Inserting "/*text*/" in "a/b" // must be "a/ /*text*/ b",
-		// as "a//*text*/b" is tokenized as a "//" comment.
-		buf2.WriteByte(' ')
-		buf2.WriteString(comment.text)
-		buf2.WriteByte(' ')
+	identIndex := 0
+	for {
+		pos, tok, lit := s.Scan()
+		switch tok {
+		case token.EOF:
+			// Copy the rest and return.
+			printBuf2.Write(src[copied:])
+			return printBuf2.Bytes(), nil
+		case token.COMMENT:
+			// Omit comments from the final Go code, again.
+			// Before we removed the comments from file.Comments,
+			// but go/printer also grabs comments from some Doc ast.Node fields.
+			// TODO: is there an easy way to filter all comments at once?
+			if strings.HasPrefix(lit, "//go:") {
+				continue // directives are kept
+			}
+			offset := fsetFile.Position(pos).Offset
+			printBuf2.Write(src[copied:offset])
+			copied = offset + len(lit)
+		case token.IDENT:
+			origOffset := origCallOffsets[identIndex]
+			identIndex++
+			if origOffset == -1 {
+				continue // identifiers which don't start func calls are left untouched
+			}
+			newName := ""
+			if !flagTiny {
+				origPos := fmt.Sprintf("%s:%d", filename, origOffset)
+				newName = hashWithPackage(lpkg, origPos) + ".go"
+				// log.Printf("%q hashed with %x to %q", origPos, curPkg.GarbleActionID, newName)
+			}
+
+			offset := fsetFile.Position(pos).Offset
+			printBuf2.Write(src[copied:offset])
+			copied = offset
+
+			// We use the "/*text*/" form, since we can use multiple of them
+			// on a single line, and they don't require extra newlines.
+			// Make sure there is whitespace at either side of a comment.
+			// Otherwise, we could change the syntax of the program.
+			// Inserting "/*text*/" in "a/b" // must be "a/ /*text*/ b",
+			// as "a//*text*/b" is tokenized as a "//" comment.
+			fmt.Fprintf(&printBuf2, " /*line %s%s:1*/ ", newPrefix, newName)
+		}
 	}
-	buf2.Write(src[copied:])
-	return buf2.Bytes(), nil
 }

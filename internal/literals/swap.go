@@ -17,7 +17,7 @@ type swap struct{}
 // check that the obfuscator interface is implemented
 var _ obfuscator = swap{}
 
-func getIndexType(dataLen int) string {
+func getIndexType(dataLen int64) string {
 	switch {
 	case dataLen <= math.MaxUint8:
 		return "byte"
@@ -34,7 +34,7 @@ func positionsToSlice(data []int) *ast.CompositeLit {
 	arr := &ast.CompositeLit{
 		Type: &ast.ArrayType{
 			Len: &ast.Ellipsis{}, // Performance optimization
-			Elt: ast.NewIdent(getIndexType(len(data))),
+			Elt: ast.NewIdent(getIndexType(int64(len(data)))),
 		},
 		Elts: []ast.Expr{},
 	}
@@ -45,12 +45,12 @@ func positionsToSlice(data []int) *ast.CompositeLit {
 }
 
 // Generates a random even swap count based on the length of data
-func generateSwapCount(dataLen int) int {
+func generateSwapCount(obfRand *mathrand.Rand, dataLen int) int {
 	swapCount := dataLen
 
 	maxExtraPositions := dataLen / 2 // Limit the number of extra positions to half the data length
 	if maxExtraPositions > 1 {
-		swapCount += mathrand.Intn(maxExtraPositions)
+		swapCount += obfRand.Intn(maxExtraPositions)
 	}
 	if swapCount%2 != 0 { // Swap count must be even
 		swapCount++
@@ -58,13 +58,13 @@ func generateSwapCount(dataLen int) int {
 	return swapCount
 }
 
-func (swap) obfuscate(data []byte) *ast.BlockStmt {
-	swapCount := generateSwapCount(len(data))
-	shiftKey := genRandByte()
+func (swap) obfuscate(rand *mathrand.Rand, data []byte, extKeys []*externalKey) *ast.BlockStmt {
+	swapCount := generateSwapCount(rand, len(data))
+	shiftKey := byte(rand.Uint32())
 
-	op := randOperator()
+	op := randOperator(rand)
 
-	positions := genRandIntSlice(len(data), swapCount)
+	positions := genRandIntSlice(rand, len(data), swapCount)
 	for i := len(positions) - 2; i >= 0; i -= 2 {
 		// Generate local key for xor based on random key and byte position
 		localKey := byte(i) + byte(positions[i]^positions[i+1]) + shiftKey
@@ -76,7 +76,7 @@ func (swap) obfuscate(data []byte) *ast.BlockStmt {
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("data")},
 			Tok: token.DEFINE,
-			Rhs: []ast.Expr{ah.DataToByteSlice(data)},
+			Rhs: []ast.Expr{dataToByteSliceWithExtKeys(rand, data, extKeys)},
 		},
 		&ast.AssignStmt{
 			Lhs: []ast.Expr{ast.NewIdent("positions")},
@@ -118,7 +118,7 @@ func (swap) obfuscate(data []byte) *ast.BlockStmt {
 							}),
 						},
 						Op: token.ADD,
-						Y:  ah.IntLit(int(shiftKey)),
+						Y:  byteLitWithExtKey(rand, shiftKey, extKeys, highProb),
 					}},
 				},
 				&ast.AssignStmt{
